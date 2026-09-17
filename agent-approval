@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+# agent-approval — single choke point for the Omarchy bar approval indicator.
+#
+# Every AI agent / hook / scanner on this machine reports pending approvals
+# through this script. The bar widget (dsskaggs.agent-approvals) watches the
+# state dir and flashes while any record exists.
+#
+# Usage:
+#   agent-approval add    <source> <id> [title] [detail]   # create/refresh a pending record
+#   agent-approval clear  <source> <id>                    # remove one record
+#   agent-approval clear  <source>                         # remove all records for a source
+#   agent-approval clear-all                               # remove everything
+#   agent-approval list                                    # JSON array of pending records
+#   agent-approval count                                   # integer
+#   agent-approval hermes-hook                             # stdin: Hermes shell-hook JSON payload
+#   agent-approval claude-hook                             # stdin: Claude Code hook JSON payload
+#   agent-approval codex-notify <json>                     # Codex notify hook (arg is JSON)
+#
+# State: ~/.local/state/omarchy/approvals/<source>__<id>.json
+
+set -u
+
+STATE_DIR="${AGENT_APPROVAL_STATE_DIR:-/home/dsskaggs/.local/state/omarchy/approvals}"
+NOTIF_DIR="${AGENT_APPROVAL_NOTIF_DIR:-/home/dsskaggs/.local/state/omarchy/approvals-notif}"
+mkdir -p "$STATE_DIR" "$NOTIF_DIR"
+
+_sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80; }
+_now() { date +%s; }
+
+# Close a desktop notification and CONFIRM it actually left the on-screen
+# popup dir before returning (best-effort past the timeout; a toast the
+# user already dismissed, or a dead id, is not an error).
+#
+# Root cause of the original bug: raw D-Bus CloseNotification only tears
+# down the freedesktop protocol object — Omarchy's notifications Service.qml
+# only removes the VISIBLE popup card (and archives its state file) through
+# its own dismissPopup()/expirePopup(), which CloseNotification never
+# triggers. The right hook is the shell's own IPC target:
+#   omarchy-shell notifications dismiss <summary-substring>
+# which walks the popup model and calls dismissPopup() for real. We match on
+# the record's TITLE (passed to notify-send -p), which is unique per record.
+_close_notification() {
+  local id="$1" title="${2:-}"
+  local popup_dir="/home/dsskaggs/.local/state/omarchy/notifications"
+  local deadline=$((SECONDS + 5))
+  while [[ $SECONDS -lt $deadline ]]; do
+    if [[ -n "$id" && "$id" =~ ^[0-9]+$ ]]; then
+      compgen -G "$popup_dir/history/*-${id}.json" > /dev/null && return 0
+      compgen -G "$popup_dir/*-${id}.json" > /dev/null || return 0
+    fi
+    if [[ -n "$title" ]]; then
+      omarchy-shell notifications dismiss "$title" >/dev/null 2>&1
+    elif [[ -n "$id" && "$id" =~ ^[0-9]+$ ]]; then
+      # No title on record (shouldn't happen via this script, but stay safe):
+      # fall back to the raw close, which at least tears down the server object.
+      gdbus call --session --dest org.freedesktop.Notifications \
+        --object-path /org/freedesktop/Notifications \
+        --method org.freedesktop.Notifications.CloseNotification "$id" \
+        >/dev/null 2>&1
+    else
+      return 0
+    fi
+    sleep 0.15
+  done
+  return 0
+}
+
+# Close and forget any notification(s) tracked for a source/id (or every
+# tracked notification for a source when id is omitted).
+_close_tracked() {
+  local source="$1" id="${2:-}"
+  local safe_src safe_id f nid title
+  safe_src="$(_sanitize "$source")"
+  if [[ -n "$id" ]]; then
+    safe_id="$(_sanitize "$id")"
+    f="$NOTIF_DIR/${safe_src}__${safe_id}.json"
+    if [[ -f "$f" ]]; then
+      nid="$(jq -r '.notif_id // empty' "$f" 2>/dev/null)"
+      title="$(jq -r '.title // empty' "$f" 2>/dev/null)"
+      _close_notification "$nid" "$title"
+      rm -f "$f"
+    fi
+  else
+    for f in "$NOTIF_DIR/${safe_src}__"*.json; do
+      [[ -e "$f" ]] || continue
+      nid="$(jq -r '.notif_id // empty' "$f" 2>/dev/null)"
+      title="$(jq -r '.title // empty' "$f" 2>/dev/null)"
+      _close_notification "$nid" "$title"
+      rm -f "$f"
+    done
+  fi
+}
+
+_write_record() {
+  local source="$1" id="$2" title="${3:-Approval needed}" detail="${4:-}"
+  local safe_src safe_id path
+  safe_src="$(_sanitize "$source")"
+  safe_id="$(_sanitize "$id")"
+  path="$STATE_DIR/${safe_src}__${safe_id}.json"
+  # jq builds the JSON so titles/details with quotes are safe.
+  jq -n \
+    --arg source "$source" \
+    --arg id "$id" \
+    --arg title "$title" \
+    --arg detail "$detail" \
+    --argjson ts "$(_now)" \
+    '{source:$source,id:$id,title:$title,detail:$detail,created_at:$ts}' \
+    > "$path.tmp" && mv -f "$path.tmp" "$path"
+}
+
+_clear_record() {
+  local source="$1" id="${2:-}"
+  local safe_src
+  safe_src="$(_sanitize "$source")"
+  if [[ -n "$id" ]]; then
+    rm -f "$STATE_DIR/${safe_src}__$(_sanitize "$id").json"
+  else
+    rm -f "$STATE_DIR/${safe_src}__"*.json
+  fi
+  # Whatever toast this record ever opened is stale the moment the record
+  # clears — close it so a right-click / hook-resolved approval doesn't
+  # leave an orphaned popup that only a manual click can dismiss.
+  _close_tracked "$source" "$id"
+}
+
+# Fire a desktop notification AND remember its id against source/id so a
+# later _clear_record can close it. Deliberately NOT critical urgency —
+# Omarchy's own notification service treats critical as "never expires",
+# which is what caused toasts to outlive the bar-light record in the first
+# place. Normal urgency still auto-dismisses after a timeout as a backstop
+# even if the explicit close below never fires.
+_notify_tracked() {
+  local source="$1" id="$2" title="$3" body="${4:-}"
+  local safe_src safe_id nid
+  safe_src="$(_sanitize "$source")"
+  safe_id="$(_sanitize "$id")"
+  nid="$(notify-send -a "Agent approval" -u normal -t 15000 -p "$title" "$body" 2>/dev/null)"
+  jq -n --arg notif_id "${nid:-}" --arg title "$title" \
+    '{notif_id:$notif_id,title:$title}' \
+    > "$NOTIF_DIR/${safe_src}__${safe_id}.json.tmp" \
+    && mv -f "$NOTIF_DIR/${safe_src}__${safe_id}.json.tmp" "$NOTIF_DIR/${safe_src}__${safe_id}.json"
+}
+
+cmd="${1:-}"; shift || true
+
+case "$cmd" in
+  add)
+    [[ $# -ge 2 ]] || { echo "usage: agent-approval add <source> <id> [title] [detail]" >&2; exit 64; }
+    _write_record "$1" "$2" "${3:-}" "${4:-}"
+    ;;
+
+  clear)
+    [[ $# -ge 1 ]] || { echo "usage: agent-approval clear <source> [id]" >&2; exit 64; }
+    _clear_record "$1" "${2:-}"
+    ;;
+
+  clear-all)
+    rm -f "$STATE_DIR"/*.json
+    for f in "$NOTIF_DIR"/*.json; do
+      [[ -e "$f" ]] || continue
+      nid="$(jq -r '.notif_id // empty' "$f" 2>/dev/null)"
+      title="$(jq -r '.title // empty' "$f" 2>/dev/null)"
+      _close_notification "$nid" "$title"
+    done
+    rm -f "$NOTIF_DIR"/*.json
+    ;;
+
+  list)
+    # Emit a single JSON array, oldest first. Empty dir → [].
+    if compgen -G "$STATE_DIR/*.json" > /dev/null; then
+      jq -s 'sort_by(.created_at)' "$STATE_DIR"/*.json
+    else
+      echo '[]'
+    fi
+    ;;
+
+  count)
+    ls -1 "$STATE_DIR"/*.json 2>/dev/null | wc -l
+    ;;
+
+  hermes-hook)
+    # Hermes shell hook. stdin = JSON with hook_event_name, session_id, extra{...}.
+    # pre_approval_request → add; post_approval_response → clear.
+    payload="$(cat)"
+    event="$(jq -r '.hook_event_name // empty' <<<"$payload")"
+    session="$(jq -r '.session_id // .extra.session_key // "unknown"' <<<"$payload")"
+    pattern="$(jq -r '.extra.pattern_key // ""' <<<"$payload")"
+    surface="$(jq -r '.extra.surface // ""' <<<"$payload")"
+    profile="${HERMES_PROFILE:-$(basename "${HERMES_HOME:-hermes}")}"
+    # Smart (aux-LLM) approvals resolve themselves in seconds; don't flash for them.
+    if [[ "$surface" == "smart" ]]; then exit 0; fi
+    key="${session}__${pattern}"
+    case "$event" in
+      pre_approval_request)
+        desc="$(jq -r '.extra.description // "Dangerous action"' <<<"$payload")"
+        cmdtxt="$(jq -r '.extra.command // ""' <<<"$payload" | head -c 200)"
+        _write_record "hermes-$profile" "$key" "Hermes ($profile) — $desc" "$cmdtxt"
+        ;;
+      post_approval_response)
+        _clear_record "hermes-$profile" "$key"
+        ;;
+    esac
+    ;;
+
+  claude-hook)
+    # Claude Code hook. stdin = JSON with hook_event_name, session_id, message, ...
+    payload="$(cat)"
+    event="$(jq -r '.hook_event_name // empty' <<<"$payload")"
+    session="$(jq -r '.session_id // "unknown"' <<<"$payload")"
+    cwd="$(jq -r '.cwd // ""' <<<"$payload")"
+    case "$event" in
+      Notification)
+        # Only permission / input-needed notifications count as approvals.
+        ntype="$(jq -r '.notification_type // ""' <<<"$payload")"
+        msg="$(jq -r '.message // "Claude Code needs input"' <<<"$payload")"
+        if [[ "$ntype" == "permission_prompt" || "$ntype" == "idle_prompt" || "$ntype" == "" ]] \
+           || grep -qiE 'permission|approv|waiting for (your )?input|needs your' <<<"$msg"; then
+          _write_record "claude-code" "$session" "Claude Code — $msg" "$cwd"
+        fi
+        ;;
+      PostToolUse|Stop|SubagentStop|UserPromptSubmit|SessionEnd)
+        # Any of these mean the prompt was answered or the session moved on.
+        _clear_record "claude-code" "$session"
+        ;;
+    esac
+    ;;
+
+  codex-notify)
+    # Codex `notify = ["agent-approval", "codex-notify"]` passes one JSON arg.
+    payload="${1:-}"
+    [[ -n "$payload" ]] || exit 0
+    ntype="$(jq -r '.type // ""' <<<"$payload" 2>/dev/null)"
+    tid="$(jq -r '."thread-id" // .thread_id // .turn_id // "unknown"' <<<"$payload" 2>/dev/null)"
+    case "$ntype" in
+      *approval*|*permission*|*request*)
+        msg="$(jq -r '."last-assistant-message" // .message // "Codex needs approval"' <<<"$payload" 2>/dev/null | head -c 160)"
+        _write_record "codex" "$tid" "Codex — approval requested" "$msg"
+        ;;
+      agent-turn-complete|*complete*)
+        _clear_record "codex" "$tid"
+        ;;
+    esac
+    ;;
+
+  notify)
+    # agent-approval notify <source> <id> <title> [body]
+    # Fires a trackable, non-critical toast for that record. Widget uses this
+    # instead of a raw notify-send so `clear` can close it later.
+    [[ $# -ge 3 ]] || { echo "usage: agent-approval notify <source> <id> <title> [body]" >&2; exit 64; }
+    _notify_tracked "$1" "$2" "$3" "${4:-}"
+    ;;
+
+  ""|-h|--help|help)
+    sed -n '2,20p' "$0"
+    ;;
+  *)
+    echo "agent-approval: unknown command '$cmd'" >&2
+    exit 64
+    ;;
+esac

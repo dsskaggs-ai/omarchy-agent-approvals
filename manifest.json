@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "dsskaggs.agent-approvals",
+  "name": "Agent approvals",
+  "version": "1.0.0",
+  "author": "dsskaggs",
+  "license": "MIT",
+  "description": "Flashing bar light whenever any AI agent on this machine is waiting on a human approval — Hermes (Telegram/Buzz/CLI), Claude Code, Codex, herdr/tmux agents.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "AgentApprovals.qml" },
+  "barWidget": {
+    "displayName": "Agent approvals",
+    "description": "Dim when nothing is pending. Flashes red with a count when one or more agents are blocked waiting for you. Left-click: jump to the oldest pending agent. Right-click: clear all.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "scanIntervalMs": 3000,
+      "flashIntervalMs": 450
+    },
+    "schema": [
+      { "key": "scanIntervalMs", "type": "integer", "label": "Scan interval (ms)", "min": 1000, "max": 30000, "step": 500, "defaultValue": 3000 },
+      { "key": "flashIntervalMs", "type": "integer", "label": "Flash interval (ms)", "min": 150, "max": 2000, "step": 50, "defaultValue": 450 }
+    ]
+  }
+}

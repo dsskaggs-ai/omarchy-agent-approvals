@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Hermes shell hook → Omarchy approvals indicator.
+# Registered for pre_approval_request / post_approval_response in config.yaml.
+# Reads the hook JSON payload on stdin; never blocks or returns directives.
+exec /home/dsskaggs/.local/bin/agent-approval hermes-hook
