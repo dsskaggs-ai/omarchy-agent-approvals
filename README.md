@@ -10,6 +10,8 @@ One light for every agent. No workspace-hopping to notice a stalled approval.
 - **Right-click** — clear every pending record (and close any toasts that opened for them).
 - **Middle-click** — force an immediate rescan.
 
+![Omarchy bar screenshot](docs/screenshot.png)
+
 ## Install
 
 ```bash
