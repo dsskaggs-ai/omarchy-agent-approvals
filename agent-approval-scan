@@ -36,10 +36,14 @@ if command -v herdr >/dev/null 2>&1 && herdr status server >/dev/null 2>&1; then
           (.terminal_title_stripped // ""), (.cwd // "") ]
       | @tsv' 2>/dev/null)
 
-  # Fallback text scan on herdr panes that host a known agent but aren't "blocked"
-  # (covers agents herdr can't classify yet, e.g. agy, gemini, aider).
+  # Fallback text scan, scoped strictly to panes herdr can't classify yet
+  # (status == "unknown", e.g. agy, gemini, aider). Agents herdr already
+  # classifies natively (claude, codex, etc. -- "working"/"idle"/"blocked")
+  # must skip this: free-text grepping a working pane's own scrollback (which
+  # can legitimately contain words like "approval" or "waiting for input",
+  # e.g. Claude discussing this very script) produces false positives.
   while IFS=$'\t' read -r pane agent status; do
-    [[ -z "$pane" || "$status" == "blocked" || -z "$agent" ]] && continue
+    [[ -z "$pane" || -z "$agent" || "$status" != "unknown" ]] && continue
     tail_text="$(herdr pane read "$pane" --lines 25 2>/dev/null | jq -r '.result.text // .result.output // empty' 2>/dev/null)"
     [[ -z "$tail_text" ]] && tail_text="$(herdr pane read "$pane" --lines 25 2>/dev/null)"
     if grep -qiE "$PROMPT_RE" <<<"$tail_text"; then
