@@ -210,11 +210,13 @@ case "$cmd" in
     cwd="$(jq -r '.cwd // ""' <<<"$payload")"
     case "$event" in
       Notification)
-        # Only permission / input-needed notifications count as approvals.
+        # Only permission prompts count as approvals. idle_prompt just means
+        # Claude is sitting idle waiting for your next message -- normal, not
+        # blocked -- so it must NOT flash the same urgent light.
         ntype="$(jq -r '.notification_type // ""' <<<"$payload")"
         msg="$(jq -r '.message // "Claude Code needs input"' <<<"$payload")"
-        if [[ "$ntype" == "permission_prompt" || "$ntype" == "idle_prompt" || "$ntype" == "" ]] \
-           || grep -qiE 'permission|approv|waiting for (your )?input|needs your' <<<"$msg"; then
+        if [[ "$ntype" == "permission_prompt" ]] \
+           || grep -qiE 'permission|approv' <<<"$msg"; then
           _write_record "claude-code" "$session" "Claude Code — $msg" "$cwd"
         fi
         ;;
