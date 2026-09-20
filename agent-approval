@@ -17,14 +17,21 @@
 #   agent-approval codex-notify <json>                     # Codex notify hook (arg is JSON)
 #
 # State: ~/.local/state/omarchy/approvals/<source>__<id>.json
+#
+# File naming: <source>__<hash8(id)> — the id is sanitized then hashed so
+# distinct ids can never collide into the same filename, and ambiguous
+# composite ids (session__pattern) can't leak separators into the key.
 
 set -u
 
-STATE_DIR="${AGENT_APPROVAL_STATE_DIR:-/home/dsskaggs/.local/state/omarchy/approvals}"
-NOTIF_DIR="${AGENT_APPROVAL_NOTIF_DIR:-/home/dsskaggs/.local/state/omarchy/approvals-notif}"
+STATE_DIR="${AGENT_APPROVAL_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/approvals}"
+NOTIF_DIR="${AGENT_APPROVAL_NOTIF_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/approvals-notif}"
+POPUP_DIR="${OMARCHY_NOTIF_DIR:-$HOME/.local/state/omarchy/notifications}"
 mkdir -p "$STATE_DIR" "$NOTIF_DIR"
 
 _sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-80; }
+# Collision-free record filename component: hash of the raw id.
+_hid() { printf '%s' "$1" | sha256sum | cut -c1-16; }
 _now() { date +%s; }
 
 # Close a desktop notification and CONFIRM it actually left the on-screen
@@ -38,16 +45,15 @@ _now() { date +%s; }
 # triggers. The right hook is the shell's own IPC target:
 #   omarchy-shell notifications dismiss <summary-substring>
 # which walks the popup model and calls dismissPopup() for real. We match on
-# the record's TITLE (passed to notify-send -p), which is unique per record.
+# the record's TITLE (passed to notify-send -p), which is unique per record —
+# the title carries the "[AA <random-tag>]" prefix minted below, so it can
+# only ever match this record's own toast.
 _close_notification() {
   local id="$1" title="${2:-}"
-  local popup_dir="/home/dsskaggs/.local/state/omarchy/notifications"
   local deadline=$((SECONDS + 5))
+  # Dismiss FIRST — file-glob confirmation can't substitute for the explicit
+  # dismiss (naming mismatches must not short-circuit it).
   while [[ $SECONDS -lt $deadline ]]; do
-    if [[ -n "$id" && "$id" =~ ^[0-9]+$ ]]; then
-      compgen -G "$popup_dir/history/*-${id}.json" > /dev/null && return 0
-      compgen -G "$popup_dir/*-${id}.json" > /dev/null || return 0
-    fi
     if [[ -n "$title" ]]; then
       omarchy-shell notifications dismiss "$title" >/dev/null 2>&1
     elif [[ -n "$id" && "$id" =~ ^[0-9]+$ ]]; then
@@ -60,6 +66,11 @@ _close_notification() {
     else
       return 0
     fi
+    # Confirmed gone? (history archive or popup dir no longer shows it live)
+    if [[ -n "$id" && "$id" =~ ^[0-9]+$ ]]; then
+      compgen -G "$POPUP_DIR/history/*-${id}.json" > /dev/null && return 0
+      compgen -G "$POPUP_DIR/*-${id}.json" > /dev/null || return 0
+    fi
     sleep 0.15
   done
   return 0
@@ -69,11 +80,10 @@ _close_notification() {
 # tracked notification for a source when id is omitted).
 _close_tracked() {
   local source="$1" id="${2:-}"
-  local safe_src safe_id f nid title
+  local safe_src f nid title
   safe_src="$(_sanitize "$source")"
   if [[ -n "$id" ]]; then
-    safe_id="$(_sanitize "$id")"
-    f="$NOTIF_DIR/${safe_src}__${safe_id}.json"
+    f="$NOTIF_DIR/${safe_src}__$(_hid "$id").json"
     if [[ -f "$f" ]]; then
       nid="$(jq -r '.notif_id // empty' "$f" 2>/dev/null)"
       title="$(jq -r '.title // empty' "$f" 2>/dev/null)"
@@ -93,19 +103,25 @@ _close_tracked() {
 
 _write_record() {
   local source="$1" id="$2" title="${3:-Approval needed}" detail="${4:-}"
-  local safe_src safe_id path
+  local safe_src path tmp
   safe_src="$(_sanitize "$source")"
-  safe_id="$(_sanitize "$id")"
-  path="$STATE_DIR/${safe_src}__${safe_id}.json"
+  path="$STATE_DIR/${safe_src}__$(_hid "$id").json"
   # jq builds the JSON so titles/details with quotes are safe.
-  jq -n \
+  # mktemp in the same dir: unique per writer, so concurrent adds never
+  # interleave through a shared tmp file; mv stays atomic.
+  tmp="$(mktemp "$STATE_DIR/.XXXXXX")"
+  if jq -n \
     --arg source "$source" \
     --arg id "$id" \
     --arg title "$title" \
     --arg detail "$detail" \
     --argjson ts "$(_now)" \
     '{source:$source,id:$id,title:$title,detail:$detail,created_at:$ts}' \
-    > "$path.tmp" && mv -f "$path.tmp" "$path"
+    > "$tmp"; then
+    mv -f "$tmp" "$path"
+  else
+    rm -f "$tmp"
+  fi
 }
 
 _clear_record() {
@@ -113,7 +129,7 @@ _clear_record() {
   local safe_src
   safe_src="$(_sanitize "$source")"
   if [[ -n "$id" ]]; then
-    rm -f "$STATE_DIR/${safe_src}__$(_sanitize "$id").json"
+    rm -f "$STATE_DIR/${safe_src}__$(_hid "$id").json"
   else
     rm -f "$STATE_DIR/${safe_src}__"*.json
   fi
@@ -131,14 +147,20 @@ _clear_record() {
 # even if the explicit close below never fires.
 _notify_tracked() {
   local source="$1" id="$2" title="$3" body="${4:-}"
-  local safe_src safe_id nid
+  local safe_src nid f tmp
   safe_src="$(_sanitize "$source")"
-  safe_id="$(_sanitize "$id")"
+  f="$NOTIF_DIR/${safe_src}__$(_hid "$id").json"
+  # Random tag makes the title globally unique so the substring-based
+  # omarchy-shell dismiss can never match an unrelated toast.
+  title="$title [AA $(head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n')]"
   nid="$(notify-send -a "Agent approval" -u normal -t 15000 -p "$title" "$body" 2>/dev/null)"
-  jq -n --arg notif_id "${nid:-}" --arg title "$title" \
-    '{notif_id:$notif_id,title:$title}' \
-    > "$NOTIF_DIR/${safe_src}__${safe_id}.json.tmp" \
-    && mv -f "$NOTIF_DIR/${safe_src}__${safe_id}.json.tmp" "$NOTIF_DIR/${safe_src}__${safe_id}.json"
+  tmp="$(mktemp "$NOTIF_DIR/.XXXXXX")"
+  if jq -n --arg notif_id "${nid:-}" --arg title "$title" \
+    '{notif_id:$notif_id,title:$title}' > "$tmp"; then
+    mv -f "$tmp" "$f"
+  else
+    rm -f "$tmp"
+  fi
 }
 
 cmd="${1:-}"; shift || true
@@ -156,6 +178,14 @@ case "$cmd" in
 
   clear-all)
     rm -f "$STATE_DIR"/*.json
+    # Fire every dismiss without polling, then one bounded verification pass.
+    for f in "$NOTIF_DIR"/*.json; do
+      [[ -e "$f" ]] || continue
+      nid="$(jq -r '.notif_id // empty' "$f" 2>/dev/null)"
+      title="$(jq -r '.title // empty' "$f" 2>/dev/null)"
+      [[ -n "$title" ]] && omarchy-shell notifications dismiss "$title" >/dev/null 2>&1
+    done
+    sleep 1
     for f in "$NOTIF_DIR"/*.json; do
       [[ -e "$f" ]] || continue
       nid="$(jq -r '.notif_id // empty' "$f" 2>/dev/null)"
@@ -183,12 +213,18 @@ case "$cmd" in
     # pre_approval_request → add; post_approval_response → clear.
     payload="$(cat)"
     event="$(jq -r '.hook_event_name // empty' <<<"$payload")"
-    session="$(jq -r '.session_id // .extra.session_key // "unknown"' <<<"$payload")"
+    session="$(jq -r '.session_id // .extra.session_key // empty' <<<"$payload")"
     pattern="$(jq -r '.extra.pattern_key // ""' <<<"$payload")"
     surface="$(jq -r '.extra.surface // ""' <<<"$payload")"
     profile="${HERMES_PROFILE:-$(basename "${HERMES_HOME:-hermes}")}"
     # Smart (aux-LLM) approvals resolve themselves in seconds; don't flash for them.
-    if [[ "$surface" == "smart" ]]; then exit 0; fi
+    [[ "$surface" == "smart" ]] && exit 0
+    # Malformed payload / unparseable session: DON'T degrade to a shared
+    # "unknown" key every failing session could clear. Bail out instead —
+    # a lost flash beats a poisoned one.
+    if [[ -z "$session" ]] || ! jq -e . >/dev/null 2>&1 <<<"$payload"; then
+      exit 0
+    fi
     key="${session}__${pattern}"
     case "$event" in
       pre_approval_request)
@@ -206,17 +242,19 @@ case "$cmd" in
     # Claude Code hook. stdin = JSON with hook_event_name, session_id, message, ...
     payload="$(cat)"
     event="$(jq -r '.hook_event_name // empty' <<<"$payload")"
-    session="$(jq -r '.session_id // "unknown"' <<<"$payload")"
+    session="$(jq -r '.session_id // empty' <<<"$payload")"
+    [[ -z "$session" ]] && exit 0
     cwd="$(jq -r '.cwd // ""' <<<"$payload")"
     case "$event" in
       Notification)
         # Only permission prompts count as approvals. idle_prompt just means
         # Claude is sitting idle waiting for your next message -- normal, not
-        # blocked -- so it must NOT flash the same urgent light.
+        # blocked -- so it must NOT flash the same urgent light. Match on
+        # notification_type alone; the old message-substring heuristic fired
+        # on any text mentioning "permission"/"approved".
         ntype="$(jq -r '.notification_type // ""' <<<"$payload")"
         msg="$(jq -r '.message // "Claude Code needs input"' <<<"$payload")"
-        if [[ "$ntype" == "permission_prompt" ]] \
-           || grep -qiE 'permission|approv' <<<"$msg"; then
+        if [[ "$ntype" == "permission_prompt" ]]; then
           _write_record "claude-code" "$session" "Claude Code — $msg" "$cwd"
         fi
         ;;
@@ -231,8 +269,10 @@ case "$cmd" in
     # Codex `notify = ["agent-approval", "codex-notify"]` passes one JSON arg.
     payload="${1:-}"
     [[ -n "$payload" ]] || exit 0
+    jq -e . >/dev/null 2>&1 <<<"$payload" || exit 0
     ntype="$(jq -r '.type // ""' <<<"$payload" 2>/dev/null)"
-    tid="$(jq -r '."thread-id" // .thread_id // .turn_id // "unknown"' <<<"$payload" 2>/dev/null)"
+    tid="$(jq -r '."thread-id" // .thread_id // .turn_id // empty' <<<"$payload" 2>/dev/null)"
+    [[ -z "$tid" ]] && exit 0
     case "$ntype" in
       *approval*|*permission*|*request*)
         msg="$(jq -r '."last-assistant-message" // .message // "Codex needs approval"' <<<"$payload" 2>/dev/null | head -c 160)"
@@ -253,7 +293,7 @@ case "$cmd" in
     ;;
 
   ""|-h|--help|help)
-    sed -n '2,20p' "$0"
+    sed -n '2,22p' "$0"
     ;;
   *)
     echo "agent-approval: unknown command '$cmd'" >&2

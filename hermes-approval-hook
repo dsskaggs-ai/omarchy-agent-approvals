@@ -2,4 +2,14 @@
 # Hermes shell hook → Omarchy approvals indicator.
 # Registered for pre_approval_request / post_approval_response in config.yaml.
 # Reads the hook JSON payload on stdin; never blocks or returns directives.
-exec /home/dsskaggs/.local/bin/agent-approval hermes-hook
+#
+# Fails open: if agent-approval is missing/unusable, exit 0 silently so the
+# Hermes hook pipeline is never aborted. Only well-formed JSON payloads are
+# forwarded — validation responsibility for contents lives in agent-approval.
+export PATH="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+AA="${HOME}/.local/bin/agent-approval"
+command -v "$AA" >/dev/null 2>&1 || exit 0
+payload="$(cat 2>/dev/null)" || exit 0
+[[ -n "$payload" ]] || exit 0
+printf '%s' "$payload" | jq -e . >/dev/null 2>&1 || exit 0
+exec "$AA" hermes-hook <<<"$payload"

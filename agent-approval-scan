@@ -10,10 +10,18 @@
 # other sources (hermes-*, claude-code, codex, manual).
 
 set -u
-export PATH="/home/dsskaggs/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 
-STATE_DIR="${AGENT_APPROVAL_STATE_DIR:-/home/dsskaggs/.local/state/omarchy/approvals}"
+STATE_DIR="${AGENT_APPROVAL_STATE_DIR:-$HOME/.local/state/omarchy/approvals}"
 mkdir -p "$STATE_DIR"
+
+# Serialize runs: the widget timer can fire while a slow run (herdr pane read
+# per pane) is still going; overlapping runs clear records the other just added.
+exec 9>"$STATE_DIR/.scan.lock"
+flock -n 9 || exit 0
+
+# Hard dependency of both detectors.
+command -v jq >/dev/null 2>&1 || exit 0
 
 # Prompts that mean "a human must answer before the agent continues".
 # Kept deliberately narrow: shell prompts like "❯" alone do NOT match.
@@ -21,20 +29,30 @@ PROMPT_RE='(Do you want to (proceed|allow|run|continue|make this edit)|Allow (on
 
 declare -A seen   # "source__id" → 1
 
+# Deterministic, collision-free key for pane ids: sha256 of the raw pane id.
+_pane_key() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+
+# Untrusted terminal text / pane titles must never carry control characters,
+# tabs, or newlines into record fields. Cap length while we're at it.
+_clean_field() { printf '%s' "$1" | tr -d '\t\r\n\000' | tr -c '[:print:]' '_' | cut -c1-160; }
+
 # ---------- 1. herdr native "blocked" ----------
 if command -v herdr >/dev/null 2>&1 && herdr status server >/dev/null 2>&1; then
-  while IFS=$'\t' read -r pane agent status title cwd; do
-    [[ -z "$pane" ]] && continue
-    if [[ "$status" == "blocked" ]]; then
-      id="$(printf '%s' "$pane" | tr ':' '_')"
-      seen["herdr__$id"]=1
-      agent-approval add herdr "$id" "${agent:-agent} blocked in herdr $pane" "${title:-$cwd}"
-    fi
-  done < <(herdr pane list 2>/dev/null | jq -r '
+  pane_list="$(herdr pane list 2>/dev/null | jq -r '
       (.result.panes // [])[]
       | [ .pane_id, (.agent // ""), (.agent_status // "unknown"),
           (.terminal_title_stripped // ""), (.cwd // "") ]
-      | @tsv' 2>/dev/null)
+      | @tsv' 2>/dev/null)"
+
+  while IFS=$'\t' read -r pane agent status title cwd; do
+    [[ -z "$pane" ]] && continue
+    if [[ "$status" == "blocked" ]]; then
+      # Record filename is keyed on hash(pane); mirror it in `seen`.
+      id="$(_pane_key "$pane")"
+      seen["herdr__$id"]=1
+      agent-approval add herdr "$pane" "$(_clean_field "${agent:-agent} blocked in herdr $pane")" "$(_clean_field "${title:-$cwd}")"
+    fi
+  done <<<"$pane_list"
 
   # Fallback text scan, scoped strictly to panes herdr can't classify yet
   # (status == "unknown", e.g. agy, gemini, aider). Agents herdr already
@@ -45,16 +63,13 @@ if command -v herdr >/dev/null 2>&1 && herdr status server >/dev/null 2>&1; then
   while IFS=$'\t' read -r pane agent status; do
     [[ -z "$pane" || -z "$agent" || "$status" != "unknown" ]] && continue
     tail_text="$(herdr pane read "$pane" --lines 25 2>/dev/null | jq -r '.result.text // .result.output // empty' 2>/dev/null)"
-    [[ -z "$tail_text" ]] && tail_text="$(herdr pane read "$pane" --lines 25 2>/dev/null)"
+    [[ -z "$tail_text" ]] && continue
     if grep -qiE "$PROMPT_RE" <<<"$tail_text"; then
-      id="$(printf '%s' "$pane" | tr ':' '_')"
-      seen["herdr__$id"]=1
-      agent-approval add herdr "$id" "${agent} waiting for input in herdr $pane" \
-        "$(grep -iE "$PROMPT_RE" <<<"$tail_text" | tail -1 | head -c 160)"
+      match="$(grep -iE "$PROMPT_RE" <<<"$tail_text" | tail -1 | head -c 160)"
+      seen["herdr__$(_pane_key "$pane")"]=1
+      agent-approval add herdr "$pane" "$(_clean_field "${agent} waiting for input in herdr $pane")" "$(_clean_field "$match")"
     fi
-  done < <(herdr pane list 2>/dev/null | jq -r '
-      (.result.panes // [])[]
-      | [ .pane_id, (.agent // ""), (.agent_status // "unknown") ] | @tsv' 2>/dev/null)
+  done <<<"$pane_list"
 fi
 
 # ---------- 2. tmux text scan ----------
@@ -62,35 +77,36 @@ if command -v tmux >/dev/null 2>&1 && tmux list-sessions >/dev/null 2>&1; then
   while IFS=$'\t' read -r pane cmd title; do
     [[ -z "$pane" ]] && continue
     # Only look at panes running something agent-ish, not idle shells.
+    # NOTE: this is a process-name allowlist, not proof of agency — a user's
+    # own interactive python session asking "[y/N]" would also match.
     case "$cmd" in
       claude|codex|opencode|gemini|aider|agy|hermes|node|python*|bun|deno|cursor-agent|goose|amp) ;;
       *) continue ;;
     esac
     tail_text="$(tmux capture-pane -p -t "$pane" -S -25 2>/dev/null)"
     if grep -qiE "$PROMPT_RE" <<<"$tail_text"; then
-      id="$(printf '%s' "$pane" | tr ':.%$' '____')"
-      seen["tmux__$id"]=1
-      agent-approval add tmux "$id" "$cmd waiting for input in tmux $pane" \
-        "$(grep -iE "$PROMPT_RE" <<<"$tail_text" | tail -1 | head -c 160)"
+      match="$(grep -iE "$PROMPT_RE" <<<"$tail_text" | tail -1 | head -c 160)"
+      seen["tmux__$(_pane_key "$pane")"]=1
+      agent-approval add tmux "$pane" "$(_clean_field "$cmd waiting for input in tmux $pane")" "$(_clean_field "$match")"
     fi
   done < <(tmux list-panes -a -F $'#{session_name}:#{window_index}.#{pane_index}\t#{pane_current_command}\t#{pane_title}' 2>/dev/null)
 fi
 
-# ---------- reconcile: drop herdr/tmux records that are no longer seen ----------
+# ---------- reconcile + stale sweep: own ONLY herdr/tmux records ----------
+# Files are named <src>__<hash16(raw id)>; when a record's file is gone or
+# stale (>6h), delete it directly. Foreign sources (hermes-*, claude-code,
+# codex, manual) are never touched — the header promises exactly that.
 for f in "$STATE_DIR"/herdr__*.json "$STATE_DIR"/tmux__*.json; do
   [[ -e "$f" ]] || continue
   key="$(basename "$f" .json)"
+  case "$key" in herdr__*|tmux__*) ;; *) continue ;; esac
   if [[ -z "${seen[$key]:-}" ]]; then
-    src="${key%%__*}"; id="${key#*__}"
-    agent-approval clear "$src" "$id"
+    rm -f -- "$f"
   fi
 done
-
-# ---------- stale sweep: anything older than 6h is almost certainly orphaned ----------
-find "$STATE_DIR" -name '*.json' -mmin +360 -print0 2>/dev/null | while IFS= read -r -d '' f; do
-  key="$(basename "$f" .json)"
-  src="${key%%__*}"; id="${key#*__}"
-  agent-approval clear "$src" "$id"
+find "$STATE_DIR" \( -name 'herdr__*.json' -o -name 'tmux__*.json' \) -mmin +360 -print0 2>/dev/null \
+| while IFS= read -r -d '' f; do
+  rm -f -- "$f"
 done
 
 exit 0
