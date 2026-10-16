@@ -27,7 +27,7 @@ jobs:
           set -euo pipefail
           ocr config set llm.url "https://api.z.ai/api/coding/paas/v4/"
           ocr config set llm.auth_token "$OCR_KEY"
-          ocr config set llm.model "glm-5.3"
+          ocr config set llm.model "glm-5.3-flash"
           ocr config set llm.use_anthropic false
           BASE=$(git merge-base "origin/$BASE_REF" "$HEAD_SHA")
           ocr review --from "$BASE" --to "$HEAD_SHA" --format json --output /tmp/ocr.json
